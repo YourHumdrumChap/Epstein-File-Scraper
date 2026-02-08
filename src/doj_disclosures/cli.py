@@ -10,6 +10,7 @@ from pathlib import Path
 
 import aiohttp
 
+from doj_disclosures.core.ai_flagger import load_training_rows_from_flagged_dir, save_ai_flagger_model, train_flagger_from_rows
 from doj_disclosures.core.config import AppConfig, CrawlSettings
 from doj_disclosures.core.crawler import Crawler, looks_downloadable
 from doj_disclosures.core.db import Database
@@ -25,6 +26,64 @@ from doj_disclosures.core.triage_index import write_semantic_sorted_index
 
 
 logger = logging.getLogger(__name__)
+
+
+async def train_flagger_cli(*, config: AppConfig, flagged_dir: Path, model_name: str, max_examples: int | None = None) -> int:
+    """Train the AI flagger from your flagged folders and save it to the DB.
+
+    Uses semantic_sorted.txt + the referenced local files for labels and features.
+    """
+
+    config.paths.output_dir.mkdir(parents=True, exist_ok=True)
+    db = Database(config.paths.db_path)
+    db.initialize_sync()
+
+    s = config.crawl
+    semantic = await build_semantic_context_async(settings=s, db=db)
+    if semantic.provider is None:
+        logger.error("Semantic provider unavailable; install semantic extra and try again")
+        return 2
+
+    rows = load_training_rows_from_flagged_dir(flagged_dir=flagged_dir)
+    if not rows:
+        logger.error("No labeled rows found under %s (expected high_value/semantic_sorted.txt and irrelevant/semantic_sorted.txt)", flagged_dir)
+        return 2
+
+    parser = DocumentParser(
+        ocr_enabled=s.ocr_enabled,
+        ocr_engine=getattr(s, "ocr_engine", "tesseract"),
+        ocr_dpi=int(getattr(s, "ocr_dpi", 200)),
+        ocr_preprocess=bool(getattr(s, "ocr_preprocess", True)),
+        ocr_median_filter=bool(getattr(s, "ocr_median_filter", True)),
+        ocr_threshold=getattr(s, "ocr_threshold", None),
+    )
+
+    res = train_flagger_from_rows(
+        rows=rows,
+        provider=semantic.provider,
+        parser=parser,
+        model_name=model_name,
+        max_examples=max_examples,
+    )
+
+    if res.hv_centroid is not None:
+        await db.set_feedback_centroid(label="high_value", model_name=model_name, centroid=res.hv_centroid)
+    if res.ir_centroid is not None:
+        await db.set_feedback_centroid(label="irrelevant", model_name=model_name, centroid=res.ir_centroid)
+
+    if res.model is not None:
+        await save_ai_flagger_model(db=db, model=res.model)
+        logger.info(
+            "trained AI flagger model_name=%s used=%s skipped=%s metrics=%s",
+            model_name,
+            res.n_used,
+            res.skipped,
+            json.dumps(res.model.metrics or {}),
+        )
+        return 0
+
+    logger.warning("centroids rebuilt but classifier not trained (need more labeled examples). used=%s skipped=%s", res.n_used, res.skipped)
+    return 1
 
 
 def _load_keywords_sync(path: Path) -> list[str]:
@@ -212,6 +271,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--allow-offsite", action="store_true")
     p.add_argument("--age-verify-opt-in", action="store_true")
     p.add_argument("--storage-layout", choices=["flat", "hashed"], default=None)
+
+    # Training mode for AI flagger
+    p.add_argument("--train-flagger", action="store_true", help="Train AI flagger from flagged folders and save model to DB")
+    p.add_argument("--flagged-dir", type=str, default="", help="Path to Flagged directory (defaults to <output>/Flagged)")
+    p.add_argument("--model-name", type=str, default="", help="Embedding model name override")
+    p.add_argument("--max-train-examples", type=int, default=0, help="Cap number of labeled docs used for training (0 = no cap)")
     return p
 
 
@@ -255,6 +320,13 @@ def main() -> None:
         crawl = replace(crawl, **overrides)
 
     cfg = replace(cfg, paths=paths, crawl=crawl)
+
+    if bool(getattr(args, "train_flagger", False)):
+        storage = plan_storage(cfg.paths.output_dir)
+        flagged_dir = Path(args.flagged_dir) if str(getattr(args, "flagged_dir", "") or "").strip() else storage.flagged_dir
+        model_name = str(args.model_name).strip() if str(getattr(args, "model_name", "") or "").strip() else str(crawl.embedding_model_name)
+        max_examples = int(args.max_train_examples) if int(getattr(args, "max_train_examples", 0) or 0) > 0 else None
+        raise SystemExit(asyncio.run(train_flagger_cli(config=cfg, flagged_dir=flagged_dir, model_name=model_name, max_examples=max_examples)))
 
     seed_urls = [str(x).strip() for x in (args.seed or []) if str(x).strip()]
     if not seed_urls:

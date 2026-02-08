@@ -75,6 +75,15 @@ class CrawlSettings:
     # there is strong keyword evidence.
     feedback_auto_triage_threshold: float = -0.22
 
+    # AI flagger: a lightweight learned classifier trained from your
+    # Flagged/high_value vs Flagged/irrelevant folders (see semantic_sorted.txt).
+    # If no trained model exists, this has no effect.
+    ai_flagger_enabled: bool = True
+    # If P(high_value) >= threshold, auto-flag.
+    ai_flagger_flag_threshold: float = 0.80
+    # If P(high_value) <= threshold, auto-triage unless there is strong keyword evidence.
+    ai_flagger_triage_threshold: float = 0.20
+
 
 @dataclass(frozen=True)
 class AppConfig:

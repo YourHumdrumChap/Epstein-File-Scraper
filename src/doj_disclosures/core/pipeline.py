@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from doj_disclosures.core.ai_flagger import LinearFlaggerModel, load_ai_flagger_model
 from doj_disclosures.core.config import CrawlSettings
 from doj_disclosures.core.db import Database
 from doj_disclosures.core.embedding_index import build_embeddings_for_text
@@ -29,6 +30,7 @@ class SemanticContext:
     model_name: str
     hv_centroid: tuple[list[float], float] | None
     ir_centroid: tuple[list[float], float] | None
+    ai_flagger: LinearFlaggerModel | None
 
 
 @dataclass(frozen=True)
@@ -89,8 +91,10 @@ async def build_semantic_context_async(*, settings: CrawlSettings, db: Database)
     topic = build_topic_vector(provider) if provider is not None else None
     hv_centroid = None
     ir_centroid = None
+    ai_flagger = None
     if provider is not None:
         hv_centroid, ir_centroid = await load_feedback_centroids(db=db, model_name=model_name)
+        ai_flagger = await load_ai_flagger_model(db=db, model_name=model_name)
 
     return SemanticContext(
         provider=provider,
@@ -98,6 +102,7 @@ async def build_semantic_context_async(*, settings: CrawlSettings, db: Database)
         model_name=model_name,
         hv_centroid=hv_centroid,
         ir_centroid=ir_centroid,
+        ai_flagger=ai_flagger,
     )
 
 
@@ -142,6 +147,7 @@ async def process_document(
     topic_sim = 0.0
     relevance_score = 0.0
     feedback_boost = 0.0
+    ai_high_value_prob: float | None = None
     host = hostname(inp.url)
     url_penalty = float(deps.penalties.get(host, 0.0) or 0.0)
 
@@ -165,10 +171,31 @@ async def process_document(
             topic_sim = rel.topic_similarity
             relevance_score = rel.relevance_score
             feedback_boost = float(getattr(rel, "feedback_similarity_boost", 0.0) or 0.0)
+
+            if bool(getattr(s, "ai_flagger_enabled", True)) and deps.semantic.ai_flagger is not None:
+                try:
+                    base_rel = compute_relevance(
+                        doc_vec=doc_vec,
+                        doc_norm=doc_norm,
+                        topic=topic,
+                        hv_centroid=None,
+                        ir_centroid=None,
+                        url_penalty=0.0,
+                        entity_density=entity_density,
+                    )
+                    ai_high_value_prob = deps.semantic.ai_flagger.predict_high_value_prob(
+                        embedding=doc_vec,
+                        relevance_score=float(base_rel.relevance_score),
+                        topic_similarity=float(base_rel.topic_similarity),
+                        entity_density=float(entity_density),
+                    )
+                except Exception:
+                    ai_high_value_prob = None
         except Exception:
             topic_sim = 0.0
             relevance_score = 0.0
             feedback_boost = 0.0
+            ai_high_value_prob = None
 
     topic_thr = 0.20
     rel_thr = 0.18
@@ -181,6 +208,7 @@ async def process_document(
     if provider is None or topic is None:
         passes_relevance = bool(hits)
     else:
+        strong_keyword_evidence = bool(hits) and len(hits) >= 2
         passes_relevance = (
             (topic_sim >= topic_thr and entity_density >= density_thr)
             or (relevance_score >= rel_thr and bool(hits) and len(hits) >= 2)
@@ -190,7 +218,6 @@ async def process_document(
         if bool(getattr(s, "feedback_auto_flag_enabled", True)):
             flag_thr = float(getattr(s, "feedback_auto_flag_threshold", 0.22))
             triage_thr = float(getattr(s, "feedback_auto_triage_threshold", -0.22))
-            strong_keyword_evidence = bool(hits) and len(hits) >= 2
 
             if feedback_boost >= flag_thr:
                 if not passes_relevance:
@@ -199,6 +226,19 @@ async def process_document(
             elif feedback_boost <= triage_thr and not strong_keyword_evidence:
                 if passes_relevance:
                     log(f"Auto-triaged by feedback model (boost={feedback_boost:.3f} <= {triage_thr:.3f})")
+                passes_relevance = False
+
+        if ai_high_value_prob is not None:
+            p_flag = float(getattr(s, "ai_flagger_flag_threshold", 0.80))
+            p_triage = float(getattr(s, "ai_flagger_triage_threshold", 0.20))
+
+            if ai_high_value_prob >= p_flag:
+                if not passes_relevance:
+                    log(f"Auto-flagged by AI flagger (p={ai_high_value_prob:.3f} >= {p_flag:.3f})")
+                passes_relevance = True
+            elif ai_high_value_prob <= p_triage and not strong_keyword_evidence:
+                if passes_relevance:
+                    log(f"Auto-triaged by AI flagger (p={ai_high_value_prob:.3f} <= {p_triage:.3f})")
                 passes_relevance = False
 
     src_path = inp.local_path
