@@ -22,6 +22,14 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+Tip: if you have multiple Python installs, you can skip activation and run everything through the venv interpreter explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -U pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -e .
+```
+
 ### Optional extras
 
 OCR (requires installing Tesseract separately):
@@ -46,6 +54,13 @@ Or:
 
 ```powershell
 python -m doj_disclosures.app
+```
+
+If you see `ModuleNotFoundError: No module named 'PySide6'`, you’re almost always running with the wrong interpreter.
+Use the venv explicitly:
+
+```powershell
+.\.venv\Scripts\python.exe -m doj_disclosures.app
 ```
 
 ## Tests
